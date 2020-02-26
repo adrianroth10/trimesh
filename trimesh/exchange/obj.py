@@ -729,6 +729,27 @@ def export_obj(mesh,
       Contains files that need to be saved in the same
       directory as the exported mesh: {file name : bytes}
     """
+
+    meshes = []
+    if util.is_instance_named(mesh, "Trimesh"):
+        meshes = [mesh]
+    elif util.is_instance_named(mesh, "Scene"):
+        meshes = mesh.dump()
+    elif isinstance(mesh, dict):
+        meshes = []
+        for key, mesh_value in mesh:
+            # only add meshes
+            if util.is_instance_named(mesh_value, "Trimesh"):
+                mesh_value.metadata['name'] = key
+                meshes.append(mesh_value)
+    elif isinstance(mesh, list):
+        meshes = [mesh_value for mesh_value in mesh
+                  if util.is_instance_named(mesh_value, "Trimesh")]
+
+    if len(meshes) == 0:
+        raise ValueError('no supported obj export types found in: {}'.format(mesh))
+
+
     # store the multiple options for formatting
     # vertex indexes for faces
     face_formats = {('v',): '{}',
@@ -736,76 +757,111 @@ def export_obj(mesh,
                     ('v', 'vt'): '{}/{}',
                     ('v', 'vn', 'vt'): '{}/{}/{}'}
     # we are going to reference face_formats with this
-    face_type = ['v']
 
-    # OBJ includes vertex color as RGB elements on the same line
-    if include_color and mesh.visual.kind in ['vertex', 'face']:
-        # create a stacked blob with position and color
-        v_blob = np.column_stack((
-            mesh.vertices,
-            to_float(mesh.visual.vertex_colors[:, :3])))
-    else:
-        # otherwise just export vertices
-        v_blob = mesh.vertices
+    # temporary mtl file to know tex_data key for joining of materials
+    temp_mtl_name = 'temp_material'
+    materials = {}
+    all_export = collections.deque()
+    for i, mesh in enumerate(meshes):
+        # Ignore meshes with no faces
+        if len(mesh.faces) == 0:
+            log.warning('skipping empty mesh!')
+            continue
+        face_type = ['v']
 
-    # add the first vertex key and convert the array
-    export = collections.deque(
-        ['v ' + util.array_to_string(
-            v_blob,
+        # OBJ includes vertex color as RGB elements on the same line
+        if include_color and mesh.visual.kind in ['vertex', 'face']:
+            # create a stacked blob with position and color
+            v_blob = np.column_stack((
+                mesh.vertices,
+                to_float(mesh.visual.vertex_colors[:, :3])))
+        else:
+            # otherwise just export vertices
+            v_blob = mesh.vertices
+
+        # add the first vertex key and convert the array
+        export = collections.deque(
+            ['v ' + util.array_to_string(
+                v_blob,
+                col_delim=' ',
+                row_delim='\nv ',
+                digits=8) + '\n'])
+
+        # only include vertex normals if they're already stored
+        if include_normals and 'vertex_normals' in mesh._cache:
+            # if vertex normals are stored in cache export them
+            face_type.append('vn')
+            export.append('vn ' + util.array_to_string(
+                mesh.vertex_normals,
+                col_delim=' ',
+                row_delim='\nvn ',
+                digits=8) + '\n')
+
+        if include_texture and hasattr(mesh.visual, 'uv'):
+            # if vertex texture exists and is the right shape
+            face_type.append('vt')
+            # add the uv coordinates
+            export.append('vt ' + util.array_to_string(
+                mesh.visual.uv,
+                col_delim=' ',
+                row_delim='\nvt ',
+                digits=8) + '\n')
+            # To avoid multiples of materials
+            material_hash = mesh.visual.material.__hash__()
+            if not material_hash in materials:
+                tex_name = 'material{}'.format(len(materials))
+                tex_data, _, _ = mesh.visual.material.to_obj(tex_name, temp_mtl_name)
+                materials[material_hash] = tex_data
+            # add the directive to use the exported material
+            export.appendleft('usemtl {}'.format(tex_name))
+
+        # the format for a single vertex reference of a face
+        face_format = face_formats[tuple(face_type)]
+        # add the exported faces to the export
+        export.append('f ' + util.array_to_string(
+            mesh.faces + 1,
             col_delim=' ',
-            row_delim='\nv ',
-            digits=8) + '\n'])
+            row_delim='\nf ',
+            value_format=face_format))
 
-    # only include vertex normals if they're already stored
-    if include_normals and 'vertex_normals' in mesh._cache:
-        # if vertex normals are stored in cache export them
-        face_type.append('vn')
-        export.append('vn ' + util.array_to_string(
-            mesh.vertex_normals,
-            col_delim=' ',
-            row_delim='\nvn ',
-            digits=8) + '\n')
+        # add mesh name if found or fallback to "object%d"
+        if 'name' in mesh.metadata:
+            export.appendleft('o {}'.format(mesh.metadata['name']))
+        elif 'file_name' in mesh.metadata:
+            export.appendleft('o {}'.format(mesh.metadata['file_name']))
+        else:
+            export.appendleft('o object{}'.format(i))
 
-    tex_data = None
-    if include_texture and hasattr(mesh.visual, 'uv'):
-        # if vertex texture exists and is the right shape
-        face_type.append('vt')
-        # add the uv coordinates
-        export.append('vt ' + util.array_to_string(
-            mesh.visual.uv,
-            col_delim=' ',
-            row_delim='\nvt ',
-            digits=8) + '\n')
-        tex_data, tex_name, mtl_name = mesh.visual.material.to_obj()
+        # append obj data joined as a single sting to the global one
+        all_export.append('\n'.join(export))
+
+    # Make the overall texture data and filename
+    all_tex_data = None
+    if include_texture and len(materials) > 0:
+        # simple hash of all materials to use for the mtl name
+        materials_hash = np.sum([key for key, _ in materials]) % 1e3
+        mtl_name = 'materials_{}.mtl'.format(materials_hash)
         # add the reference to the MTL file
         export.appendleft('mtllib {}'.format(mtl_name))
-        # add the directive to use the exported material
-        export.appendleft('usemtl {}'.format(tex_name))
 
-    # the format for a single vertex reference of a face
-    face_format = face_formats[tuple(face_type)]
-    # add the exported faces to the export
-    export.append('f ' + util.array_to_string(
-        mesh.faces + 1,
-        col_delim=' ',
-        row_delim='\nf ',
-        value_format=face_format))
-
-    # add object name if found in metadata
-    if 'name' in mesh.metadata:
-        export.appendleft('o {}'.format(mesh.metadata['name']))
+        # Join materials to a string for the mtl file and all image files
+        # Using pop to remove the mtl string from the dict
+        all_tex_data = {mtl_name: '\n'.join([tex_data.pop(temp_mtl_name, '')
+                                             for _, tex_data in materials])}
+        # Transferring all image files aswell
+        [all_tex_data.update(tex_data) for _, tex_data in materials]
 
     # add a created-with header to the top of the file
-    export.appendleft('# https://github.com/mikedh/trimesh')
+    all_export.appendleft(['# https://github.com/mikedh/trimesh'])
 
     # combine elements into a single string
-    export = '\n'.join(export)
+    all_export = '\n'.join(all_export)
 
     # if we exported texture it changes returned values
-    if include_texture and tex_data is not None:
-        return export, tex_data
+    if include_texture and all_tex_data is not None:
+        return all_export, all_tex_data
 
-    return export
+    return all_export
 
 
 _obj_loaders = {'obj': load_obj}
