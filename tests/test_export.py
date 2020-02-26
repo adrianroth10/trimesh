@@ -211,6 +211,17 @@ class ExportTest(g.unittest.TestCase):
         # faces should be same
         assert g.np.allclose(x.faces, y.faces)
 
+    def test_multi_obj(self):
+        """
+        If multiple objects are exported either through a scene as
+        a list or as a dict check the following
+
+        - the number of total faces and vertices are correct
+        - the number of total materials are correct
+        """
+        assert m.vertex_normals.shape == reconstructed.vertex_normals.shape
+
+
     def test_dict(self):
         mesh = g.get_mesh('machinist.XAML')
         assert mesh.visual.kind == 'face'
